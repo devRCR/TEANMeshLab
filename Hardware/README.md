@@ -1,6 +1,8 @@
 # Wireless Sensor Network with DigiMesh Protocol
 
-![3DModel](3DModel.png)
+<p align="center">
+  <img src="3DModel.png" alt="3D Model" />
+</p>
 
 ## Overview
 
