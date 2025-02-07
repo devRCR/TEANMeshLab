@@ -1,4 +1,4 @@
-# Wireless Sensor Network with DigiMesh Protocol
+# Wireless Sensor Network with DigiMesh Protocol for TEAN (Nuclear Analytical Techniques) laboratories 
 
 <p align="center">
   <img src="3DModel.png" alt="3D Model" />
