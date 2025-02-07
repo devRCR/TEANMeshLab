@@ -1,0 +1,19 @@
+{
+	"folders": [
+		{
+			"path": "."
+		}
+	],
+	"settings": {
+		"files.associations": {
+			"*.py": "python",
+			"algorithm": "cpp",
+			"iterator": "cpp",
+			"xhash": "cpp",
+			"xmemory": "cpp",
+			"xtree": "cpp",
+			"xutility": "cpp",
+			"chrono": "cpp"
+		}
+	}
+}
