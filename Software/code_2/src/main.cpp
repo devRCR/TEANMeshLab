@@ -4,6 +4,8 @@
 #include <Adafruit_SH110X.h>
 #include <WiFi.h>
 #include <esp_bt.h>
+#include <esp_pm.h>
+#include <esp_sleep.h>
 
 // Configuración de la pantalla OLED
 #define I2C_ADDRESS 0x3C
@@ -12,11 +14,14 @@
 
 // Configuración del sensor y muestras
 #define SHT31_ADDRESS 0x44
-#define UPDATE_INTERVAL 2000
+#define UPDATE_INTERVAL 2000  // Aumentado a 2 segundos para mayor ahorro
 #define NUM_SAMPLES 2
 
 // Compensación de temperatura
 #define TEMP_OFFSET 0.0  // Ajuste según la diferencia observada
+
+// Configuración de Light Sleep
+#define LIGHT_SLEEP_DURATION_US 3000000  // 3 segundos en microsegundos
 
 // Objetos de pantalla y sensor
 Adafruit_SH1106G display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
@@ -32,6 +37,39 @@ int validSamples = 0;
 // Configuración del módulo XBee
 uint8_t destAddress[8] = {0x00, 0x13, 0xA2, 0x00, 0x41, 0x4F, 0xED, 0xDD};
 HardwareSerial xbeeSerial(2);  // UART2 para XBee
+
+// Función para configurar el modo de bajo consumo
+void configureLowPowerMode() {
+  // Configurar gestión de energía para Light Sleep automático
+  esp_pm_config_esp32_t pm_config;
+  pm_config.max_freq_mhz = 80;           // Reducir frecuencia máxima a 80MHz
+  pm_config.min_freq_mhz = 10;           // Frecuencia mínima a 10MHz
+  pm_config.light_sleep_enable = true;    // Habilitar Light Sleep automático
+  esp_pm_configure(&pm_config);
+  
+  // Configurar CPU a frecuencia más baja
+  setCpuFrequencyMhz(80);
+  
+  Serial.println("Modo de bajo consumo configurado");
+}
+
+// Función para entrar en Light Sleep manual
+void enterLightSleep(uint64_t sleep_time_us) {
+  Serial.println("Entrando en Light Sleep por " + String(sleep_time_us/1000000) + " segundos");
+  
+  // Guardar el estado actual de la pantalla (opcional)
+  // No es necesario apagar la pantalla, ya que la librería no soporta displayOff/displayOn
+  
+  // Configurar timer para despertar
+  esp_sleep_enable_timer_wakeup(sleep_time_us);
+  
+  // Entrar en Light Sleep
+  esp_light_sleep_start();
+  
+  // Al despertar, la pantalla sigue activa
+  
+  Serial.println("Despertando de Light Sleep");
+}
 
 // Funciones del XBee
 void sendXBeeData(String data) {
@@ -60,15 +98,22 @@ void sendXBeeData(String data) {
 
   // Enviar la trama al XBee
   xbeeSerial.write(frame, frameLength);
+  
+  // Esperar a que se complete la transmisión
+  xbeeSerial.flush();
 }
 
 void setup() {
   Serial.begin(115200);
 
-  // Deshabilitar WiFi y Bluetooth
+  // Configurar modo de bajo consumo PRIMERO
+  configureLowPowerMode();
+
+  // Deshabilitar WiFi y Bluetooth de forma más completa
   WiFi.mode(WIFI_OFF);
   WiFi.disconnect(true);
   btStop();
+  esp_bt_controller_disable();
 
   // Inicializar pantalla OLED
   if (!display.begin(I2C_ADDRESS, true)) {
@@ -80,6 +125,7 @@ void setup() {
   display.setTextColor(SH110X_WHITE);
   display.setCursor(0, 0);
   display.println(F("Iniciando..."));
+  display.println(F("Modo Light Sleep"));
   display.display();
   delay(2000);
 
@@ -97,6 +143,8 @@ void setup() {
 
   // Inicializar XBee (UART2)
   xbeeSerial.begin(9600);  // Configuración del puerto UART2
+  
+  Serial.println("Sistema iniciado - Light Sleep habilitado");
 }
 
 void drawSignalBars(int level) {
@@ -177,7 +225,7 @@ void loop() {
       float avgTemp = calculateAverage(tempReadings, NUM_SAMPLES);
       float avgHum = calculateAverage(humReadings, NUM_SAMPLES);
 
-      // Cambiar nivel de señal cada 2 segundos
+      // Cambiar nivel de señal cada actualización
       int signalLevel = (currentMillis / UPDATE_INTERVAL) % 5;
 
       // Mostrar datos en pantalla
@@ -186,6 +234,17 @@ void loop() {
       // Enviar datos de temperatura y humedad al XBee
       String dataToSend = "T:" + String(avgTemp) + " H:" + String(avgHum);
       sendXBeeData(dataToSend);
+      
+      Serial.println("Datos enviados: " + dataToSend);
+      
+      // Pequeña pausa para asegurar transmisión completa
+      delay(100);
+      
+      // Entrar en Light Sleep para ahorrar energía
+      enterLightSleep(LIGHT_SLEEP_DURATION_US);
     }
   }
+  
+  // Pequeño delay para permitir Light Sleep automático cuando no hay actividad
+  delay(10);
 }
