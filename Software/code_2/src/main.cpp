@@ -1,3 +1,4 @@
+// ============================= INCLUDES =============================
 #include <Arduino.h>
 #include <Wire.h>
 #include <Adafruit_SHT31.h>
@@ -7,151 +8,171 @@
 #include <esp_pm.h>
 #include <esp_sleep.h>
 
-// Configuración de la pantalla OLED
+// ============================= CONFIGURACIÓN =============================
+// Hardware
 #define I2C_ADDRESS 0x3C
 #define SCREEN_WIDTH 128
 #define SCREEN_HEIGHT 64
-
-// Configuración del sensor y muestras
 #define SHT31_ADDRESS 0x44
-#define UPDATE_INTERVAL 2000  // Aumentado a 2 segundos para mayor ahorro
-#define NUM_SAMPLES 2
+#define XBEE_UART 2
+#define I2C_CLOCK 100000
 
-// Compensación de temperatura
-#define TEMP_OFFSET 0.0  // Ajuste según la diferencia observada
+// Muestreo
+#define NUM_SAMPLES 10
+#define TEMP_OFFSET 0.0
+#define SAMPLE_BURST_INTERVAL_MS 100    // 100ms entre muestras durante el burst
+#define TRANSMISSION_INTERVAL_MS 5000   // Cada 5 segundos tomar las 10 muestras
+#define DISPLAY_UPDATE_INTERVAL_MS 5000 // Actualizar display cada 5 segundos
+#define SENSOR_TIMEOUT_MS 100
 
-// Configuración de Light Sleep
-#define LIGHT_SLEEP_DURATION_US 3000000  // 3 segundos en microsegundos
+// Power Management
+#define LIGHT_SLEEP_DURATION_US 500000
+#define CPU_FREQ_MHZ 80
+#define CPU_MIN_FREQ_MHZ 10
 
-// Objetos de pantalla y sensor
-Adafruit_SH1106G display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
-Adafruit_SHT31 sht31 = Adafruit_SHT31();
+// Debug condicional
+#define DEBUG_ENABLED 0
+#if DEBUG_ENABLED
+  #define DEBUG_PRINT(x) Serial.print(x)
+  #define DEBUG_PRINTLN(x) Serial.println(x)
+  #define DEBUG_PRINTF(fmt, ...) Serial.printf(fmt, __VA_ARGS__)
+#else
+  #define DEBUG_PRINT(x)
+  #define DEBUG_PRINTLN(x)
+  #define DEBUG_PRINTF(fmt, ...)
+#endif
 
-// Variables globales
-unsigned long lastUpdateTime = 0;
-float tempReadings[NUM_SAMPLES] = {0};
-float humReadings[NUM_SAMPLES] = {0};
-int sampleIndex = 0;
-int validSamples = 0;
-
-// Configuración del módulo XBee
-uint8_t destAddress[8] = {0x00, 0x13, 0xA2, 0x00, 0x41, 0x4F, 0xED, 0xDD};
-HardwareSerial xbeeSerial(2);  // UART2 para XBee
-
-// Función para configurar el modo de bajo consumo
-void configureLowPowerMode() {
-  // Configurar gestión de energía para Light Sleep automático
-  esp_pm_config_esp32_t pm_config;
-  pm_config.max_freq_mhz = 80;           // Reducir frecuencia máxima a 80MHz
-  pm_config.min_freq_mhz = 10;           // Frecuencia mínima a 10MHz
-  pm_config.light_sleep_enable = true;    // Habilitar Light Sleep automático
-  esp_pm_configure(&pm_config);
+// ============================= ESTRUCTURAS DE DATOS =============================
+struct SensorReading {
+  float temperature;
+  float humidity;
+  bool isValid;
   
-  // Configurar CPU a frecuencia más baja
-  setCpuFrequencyMhz(80);
-  
-  Serial.println("Modo de bajo consumo configurado");
-}
+  SensorReading() : temperature(0.0), humidity(0.0), isValid(false) {}
+  SensorReading(float temp, float hum) : temperature(temp), humidity(hum), isValid(true) {}
+};
 
-// Función para entrar en Light Sleep manual
-void enterLightSleep(uint64_t sleep_time_us) {
-  Serial.println("Entrando en Light Sleep por " + String(sleep_time_us/1000000) + " segundos");
-  
-  // Guardar el estado actual de la pantalla (opcional)
-  // No es necesario apagar la pantalla, ya que la librería no soporta displayOff/displayOn
-  
-  // Configurar timer para despertar
-  esp_sleep_enable_timer_wakeup(sleep_time_us);
-  
-  // Entrar en Light Sleep
-  esp_light_sleep_start();
-  
-  // Al despertar, la pantalla sigue activa
-  
-  Serial.println("Despertando de Light Sleep");
-}
+class CircularBuffer {
+private:
+  float tempBuffer[NUM_SAMPLES];
+  float humBuffer[NUM_SAMPLES];
+  uint8_t count;
 
-// Funciones del XBee
-void sendXBeeData(String data) {
-  uint8_t dataLength = data.length();
-  uint8_t frameLength = dataLength + 15;
-  uint8_t frameDataLength = frameLength - 4;
-  uint8_t frame[frameLength];
-
-  frame[0] = 0x7E;  // Byte de inicio de la trama API
-  frame[1] = (frameDataLength >> 8) & 0xFF;  // Longitud alta del frame data
-  frame[2] = frameDataLength & 0xFF;  // Longitud baja del frame data
-  frame[3] = 0x00;  // Tipo de trama (0x00 para trama de transmisión)
-  frame[4] = 0x01;  // Frame ID (puede ser cualquier valor)
-  memcpy(&frame[5], destAddress, 8);  // Dirección de destino
-  frame[13] = 0x00;  // Opciones de transmisión (0x00 para transmisión estándar)
-
-  // Copiar los datos a enviar en la trama
-  data.getBytes(&frame[14], dataLength + 1);
-
-  // Calcular el checksum
-  uint8_t checksum = 0;
-  for (int i = 3; i < frameLength - 1; i++) {
-    checksum += frame[i];
+public:
+  CircularBuffer() : count(0) {
+    memset(tempBuffer, 0, sizeof(tempBuffer));
+    memset(humBuffer, 0, sizeof(humBuffer));
   }
-  frame[frameLength - 1] = 0xFF - (checksum & 0xFF);  // Añadir el checksum al final de la trama
 
-  // Enviar la trama al XBee
-  xbeeSerial.write(frame, frameLength);
+  void addReading(const SensorReading& reading) {
+    if (count < NUM_SAMPLES) {
+      tempBuffer[count] = reading.temperature;
+      humBuffer[count] = reading.humidity;
+      count++;
+    }
+  }
+
+  bool isFull() const { return count == NUM_SAMPLES; }
+  uint8_t getCount() const { return count; }
   
-  // Esperar a que se complete la transmisión
-  xbeeSerial.flush();
-}
+  void clear() { count = 0; }
 
-void setup() {
-  Serial.begin(115200);
+  SensorReading getAverage() const {
+    if (count == 0) return SensorReading();
+    
+    float tempSum = 0, humSum = 0;
+    for (uint8_t i = 0; i < count; i++) {
+      tempSum += tempBuffer[i];
+      humSum += humBuffer[i];
+    }
+    
+    return SensorReading(tempSum / count, humSum / count);
+  }
+};
 
-  // Configurar modo de bajo consumo PRIMERO
-  configureLowPowerMode();
+struct SystemTimers {
+  unsigned long lastTransmission;
+  uint16_t cycleCount;
+  
+  SystemTimers() : lastTransmission(0), cycleCount(0) {}
+  
+  void init() {
+    lastTransmission = millis();
+  }
+};
 
-  // Deshabilitar WiFi y Bluetooth de forma más completa
+// ============================= OBJETOS GLOBALES =============================
+Adafruit_SH1106G display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+Adafruit_SHT31 sht31;
+HardwareSerial xbeeSerial(XBEE_UART);
+
+const uint8_t xbeeDestAddress[8] = {0x00, 0x13, 0xA2, 0x00, 0x41, 0x4F, 0xED, 0xDD};
+uint8_t xbeeFrameBuffer[64];
+
+CircularBuffer sensorBuffer;
+SystemTimers timers;
+
+// ============================= FUNCIONES AUXILIARES =============================
+void initializePowerManagement() {
+  Serial.println("Configurando power management...");
+  
+  // CPU frequency
+  setCpuFrequencyMhz(CPU_FREQ_MHZ);
+  Serial.printf("CPU configurado a %dMHz\n", CPU_FREQ_MHZ);
+  
+  // Disable radios
   WiFi.mode(WIFI_OFF);
   WiFi.disconnect(true);
   btStop();
   esp_bt_controller_disable();
-
-  // Inicializar pantalla OLED
-  if (!display.begin(I2C_ADDRESS, true)) {
-    Serial.println(F("Fallo en la pantalla OLED"));
-    while (true);
-  }
-  display.clearDisplay();
-  display.setTextSize(1);
-  display.setTextColor(SH110X_WHITE);
-  display.setCursor(0, 0);
-  display.println(F("Iniciando..."));
-  display.println(F("Modo Light Sleep"));
-  display.display();
-  delay(2000);
-
-  // Inicializar sensor SHT31
-  if (!sht31.begin(SHT31_ADDRESS)) {
-    Serial.println(F("Error iniciando SHT31"));
-    display.clearDisplay();
-    display.setCursor(0, 0);
-    display.println(F("Error SHT31"));
-    display.display();
-    while (true);
-  }
-
-  display.clearDisplay();
-
-  // Inicializar XBee (UART2)
-  xbeeSerial.begin(9600);  // Configuración del puerto UART2
+  esp_bt_mem_release(ESP_BT_MODE_BTDM);
+  Serial.println("WiFi y Bluetooth deshabilitados");
   
-  Serial.println("Sistema iniciado - Light Sleep habilitado");
+  // Power management config
+  esp_pm_config_esp32_t pm_config = {
+    .max_freq_mhz = CPU_FREQ_MHZ,
+    .min_freq_mhz = CPU_MIN_FREQ_MHZ,
+    .light_sleep_enable = true
+  };
+  
+  esp_err_t result = esp_pm_configure(&pm_config);
+  Serial.printf("Power Management: %s\n", result == ESP_OK ? "OK" : "ERROR");
+  
+  // I2C optimization
+  Wire.setClock(I2C_CLOCK);
+  Serial.printf("I2C configurado a %dHz\n", I2C_CLOCK);
 }
 
-void drawSignalBars(int level) {
-  for (int i = 0; i < 5; i++) {
-    int height = (i * 2) + 2;
-    int x = 100 + (i * 4);
-    int y = 10 - (i * 2);
+bool readSensorData(SensorReading& reading) {
+  unsigned long startTime = millis();
+  
+  float temp, hum;
+  if (!sht31.readBoth(&temp, &hum)) {
+    return false;
+  }
+  
+  if (millis() - startTime > SENSOR_TIMEOUT_MS) {
+    DEBUG_PRINTLN("Sensor timeout");
+    return false;
+  }
+  
+  // Apply offset and validate ranges
+  temp += TEMP_OFFSET;
+  if (temp < -40 || temp > 85 || hum < 0 || hum > 100) {
+    DEBUG_PRINTLN("Valores fuera de rango");
+    return false;
+  }
+  
+  reading = SensorReading(temp, hum);
+  return true;
+}
+
+void drawSignalBars(uint8_t level) {
+  for (uint8_t i = 0; i < 5; i++) {
+    uint8_t height = (i * 2) + 2;
+    uint8_t x = 100 + (i * 4);
+    uint8_t y = 10 - (i * 2);
+    
     if (i < level) {
       display.fillRect(x, y, 3, height, SH110X_WHITE);
     } else {
@@ -160,91 +181,188 @@ void drawSignalBars(int level) {
   }
 }
 
-float calculateAverage(float *readings, int numReadings) {
-  float sum = 0;
-  for (int i = 0; i < numReadings; i++) {
-    sum += readings[i];
-  }
-  return sum / numReadings;
-}
-
-void displayData(float avgTemp, float avgHum, int signalLevel) {
+void updateDisplay(const SensorReading& data, uint8_t signalLevel) {
   display.clearDisplay();
-
-  // Mostrar texto principal
+  
+  // Header
   display.setTextSize(2);
   display.setCursor(35, 0);
   display.print(F("TEAN"));
-
-  // Dibujar barras de señal
+  
   drawSignalBars(signalLevel);
-
-  // Dibujar línea separadora
   display.drawLine(0, 16, SCREEN_WIDTH, 16, SH110X_WHITE);
-
-  // Mostrar temperatura promedio
+  
+  // Temperature
   display.setCursor(0, 25);
   display.print(F("T: "));
-  display.print(avgTemp);
+  display.print(data.temperature, 1);
   display.print(F(" C"));
-
-  // Mostrar humedad promedio
+  
+  // Humidity
   display.setCursor(0, 45);
   display.print(F("H: "));
-  display.print(avgHum);
+  display.print(data.humidity, 1);
   display.print(F(" %"));
-
-  // Actualizar pantalla
+  
   display.display();
 }
 
+void sendXBeeData(const SensorReading& data) {
+  char dataStr[24];
+  snprintf(dataStr, sizeof(dataStr), "T:%.1f H:%.1f", data.temperature, data.humidity);
+  
+  const uint8_t dataLen = strlen(dataStr);
+  const uint8_t frameLen = dataLen + 15;
+  const uint8_t frameDataLen = frameLen - 4;
+  
+  if (frameLen > sizeof(xbeeFrameBuffer)) {
+    Serial.println("Error: Datos muy largos para XBee");
+    return;
+  }
+  
+  // Build XBee API frame
+  xbeeFrameBuffer[0] = 0x7E;
+  xbeeFrameBuffer[1] = (frameDataLen >> 8) & 0xFF;
+  xbeeFrameBuffer[2] = frameDataLen & 0xFF;
+  xbeeFrameBuffer[3] = 0x00;
+  xbeeFrameBuffer[4] = 0x01;
+  memcpy(&xbeeFrameBuffer[5], xbeeDestAddress, 8);
+  xbeeFrameBuffer[13] = 0x00;
+  memcpy(&xbeeFrameBuffer[14], dataStr, dataLen);
+  
+  // Calculate checksum
+  uint8_t checksum = 0;
+  for (uint8_t i = 3; i < frameLen - 1; i++) {
+    checksum += xbeeFrameBuffer[i];
+  }
+  xbeeFrameBuffer[frameLen - 1] = 0xFF - (checksum & 0xFF);
+  
+  xbeeSerial.write(xbeeFrameBuffer, frameLen);
+  xbeeSerial.flush();
+  
+  DEBUG_PRINTF("XBee enviado: %s\n", dataStr);
+  Serial.printf("Transmisión: %s\n", dataStr);
+}
+
+void enterLightSleep() {
+  DEBUG_PRINTF("Light Sleep: %lums\n", LIGHT_SLEEP_DURATION_US / 1000);
+  
+  Serial.flush();
+  esp_sleep_enable_timer_wakeup(LIGHT_SLEEP_DURATION_US);
+  esp_light_sleep_start();
+  
+  DEBUG_PRINTLN("Despertar de Light Sleep");
+}
+
+// ============================= SETUP =============================
+void setup() {
+  Serial.begin(115200);
+  delay(2000);
+  
+  Serial.println("===================");
+  Serial.println("TEAN - Sistema Optimizado");
+  Serial.println("Iniciando...");
+  
+  // Initialize power management
+  initializePowerManagement();
+  
+  // Initialize display
+  Serial.println("Inicializando display...");
+  if (!display.begin(I2C_ADDRESS, true)) {
+    Serial.println("Error: Display OLED falló");
+    delay(2000);
+  } else {
+    Serial.println("Display OLED: OK");
+    display.setContrast(255);
+    
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setTextColor(SH110X_WHITE);
+    display.setCursor(0, 0);
+    display.println(F("TEAN - Optimizado"));
+    display.println(F("Iniciando..."));
+    display.display();
+    delay(1000);
+  }
+  
+  // Initialize sensor
+  Serial.println("Inicializando sensor...");
+  if (!sht31.begin(SHT31_ADDRESS)) {
+    Serial.println("Error: Sensor SHT31 falló");
+    delay(2000);
+  } else {
+    Serial.println("Sensor SHT31: OK");
+  }
+  
+  // Initialize XBee
+  Serial.println("Inicializando XBee...");
+  xbeeSerial.begin(9600);
+  delay(250);
+  Serial.println("XBee: OK");
+  
+  timers.init();
+  Serial.println("Sistema listo!");
+  Serial.flush();
+}
+
+// ============================= LOOP PRINCIPAL =============================
 void loop() {
-  unsigned long currentMillis = millis();
-
-  if (currentMillis - lastUpdateTime >= UPDATE_INTERVAL) {
-    lastUpdateTime = currentMillis;
-
-    // Leer datos del sensor con corrección de temperatura
-    float temperature = sht31.readTemperature() + TEMP_OFFSET;
-    float humidity = sht31.readHumidity();
-
-    if (isnan(temperature) || isnan(humidity)) {
-      Serial.println(F("Error leyendo datos del sensor"));
-      return;
+  unsigned long now = millis();
+  
+  // Realizar muestreo cada 5 segundos
+  if (now - timers.lastTransmission >= TRANSMISSION_INTERVAL_MS) {
+    timers.lastTransmission = now;
+    timers.cycleCount++;
+    
+    Serial.printf("Iniciando ciclo %d - Tomando %d muestras...\n", timers.cycleCount, NUM_SAMPLES);
+    
+    // Limpiar buffer y tomar 10 muestras consecutivas
+    sensorBuffer.clear();
+    
+    for (uint8_t sample = 0; sample < NUM_SAMPLES; sample++) {
+      SensorReading reading;
+      if (readSensorData(reading)) {
+        sensorBuffer.addReading(reading);
+        DEBUG_PRINTF("Muestra %d/%d - T:%.1f H:%.1f\n", 
+                     sample + 1, NUM_SAMPLES,
+                     reading.temperature, reading.humidity);
+      } else {
+        DEBUG_PRINTF("Error en muestra %d\n", sample + 1);
+      }
+      
+      // Pausa corta entre muestras
+      if (sample < NUM_SAMPLES - 1) {
+        delay(SAMPLE_BURST_INTERVAL_MS);
+      }
     }
-
-    // Actualizar lecturas
-    tempReadings[sampleIndex] = temperature;
-    humReadings[sampleIndex] = humidity;
-    sampleIndex = (sampleIndex + 1) % NUM_SAMPLES;
-
-    if (validSamples < NUM_SAMPLES) validSamples++;
-
-    // Calcular y mostrar promedios si hay suficientes datos
-    if (validSamples == NUM_SAMPLES) {
-      float avgTemp = calculateAverage(tempReadings, NUM_SAMPLES);
-      float avgHum = calculateAverage(humReadings, NUM_SAMPLES);
-
-      // Cambiar nivel de señal cada actualización
-      int signalLevel = (currentMillis / UPDATE_INTERVAL) % 5;
-
-      // Mostrar datos en pantalla
-      displayData(avgTemp, avgHum, signalLevel);
-
-      // Enviar datos de temperatura y humedad al XBee
-      String dataToSend = "T:" + String(avgTemp) + " H:" + String(avgHum);
-      sendXBeeData(dataToSend);
+    
+    // Calcular promedio y transmitir
+    if (sensorBuffer.getCount() > 0) {
+      SensorReading average = sensorBuffer.getAverage();
       
-      Serial.println("Datos enviados: " + dataToSend);
+      // Enviar por XBee
+      sendXBeeData(average);
       
-      // Pequeña pausa para asegurar transmisión completa
-      delay(100);
+      // Actualizar display
+      uint8_t signalLevel = (timers.cycleCount % 5) + 1;
+      updateDisplay(average, signalLevel);
       
-      // Entrar en Light Sleep para ahorrar energía
-      enterLightSleep(LIGHT_SLEEP_DURATION_US);
+      Serial.printf("Ciclo %d completado - Promedio de %d muestras: T:%.1f°C H:%.1f%%\n", 
+                    timers.cycleCount, sensorBuffer.getCount(), 
+                    average.temperature, average.humidity);
+    } else {
+      Serial.println("Error: No se pudieron obtener muestras válidas");
+      
+      // Mostrar error en display
+      display.setTextSize(1);
+      display.setCursor(0, 55);
+      display.print(F("ERR:SENSOR"));
+      display.display();
     }
   }
   
-  // Pequeño delay para permitir Light Sleep automático cuando no hay actividad
-  delay(10);
+  // Light sleep entre ciclos de muestreo
+  delay(50);
+  enterLightSleep();
+  delay(100);
 }
